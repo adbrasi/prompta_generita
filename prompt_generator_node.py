@@ -356,6 +356,93 @@ class PackPromptGeneratorCore:
         return None
 
     @staticmethod
+    def _normalize_sequence_key(text: str) -> str:
+        return re.sub(r"\s+", "", text.strip())
+
+    @staticmethod
+    def _parse_sequence_input(value: str) -> List[int]:
+        if not value or not str(value).strip():
+            return []
+        raw = str(value).strip()
+        parts = [p.strip() for p in raw.split(";") if p.strip()]
+        if not parts:
+            return []
+
+        indices: List[int] = []
+        for part in parts:
+            if "~" in part:
+                start_str, end_str = [p.strip() for p in part.split("~", 1)]
+                if not start_str.isdigit() or not end_str.isdigit():
+                    raise ValueError("Sequência inválida. Use números em '5~11' ou '5;10;80'.")
+                start = int(start_str)
+                end = int(end_str)
+                if start <= 0 or end <= 0:
+                    raise ValueError("Sequência inválida. Os índices devem ser >= 1.")
+                step = 1 if start <= end else -1
+                indices.extend(list(range(start, end + step, step)))
+            else:
+                if not part.isdigit():
+                    raise ValueError("Sequência inválida. Use números em '5~11' ou '5;10;80'.")
+                idx = int(part)
+                if idx <= 0:
+                    raise ValueError("Sequência inválida. Os índices devem ser >= 1.")
+                indices.append(idx)
+        return indices
+
+    def _sequence_state_path(self) -> Path:
+        return self.base_path / ".character_sequence_state.json"
+
+    def _load_sequence_state(self) -> Dict[str, int]:
+        path = self._sequence_state_path()
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items() if isinstance(v, int)}
+        except Exception as e:
+            logger.warning(f"Falha ao ler estado de sequência: {e}")
+        return {}
+
+    def _save_sequence_state(self, state: Dict[str, int]) -> None:
+        path = self._sequence_state_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=True, indent=2)
+        except Exception as e:
+            logger.warning(f"Falha ao salvar estado de sequência: {e}")
+
+    def _select_row_by_sequence(self,
+                                df: pd.DataFrame,
+                                sequence_input: str,
+                                spreadsheet: str) -> pd.Series:
+        indices = self._parse_sequence_input(sequence_input)
+        if not indices:
+            raise ValueError("Sequência vazia. Use algo como '5~11' ou '5;10;80'.")
+
+        total_rows = len(df)
+        if total_rows == 0:
+            raise ValueError("Planilha vazia.")
+
+        for idx in indices:
+            if idx < 1 or idx > total_rows:
+                raise ValueError(f"Índice {idx} fora do intervalo da planilha (1..{total_rows}).")
+
+        state = self._load_sequence_state()
+        key = f"{spreadsheet}|{self._normalize_sequence_key(sequence_input)}"
+        next_pos = state.get(key, 0)
+        if not isinstance(next_pos, int) or next_pos < 0 or next_pos >= len(indices):
+            next_pos = 0
+
+        selected_index = indices[next_pos]
+        row = df.iloc[selected_index - 1]
+
+        state[key] = (next_pos + 1) % len(indices)
+        self._save_sequence_state(state)
+        return row
+
+    @staticmethod
     def _is_empty_civitai_id(value: Any) -> bool:
         if value is None:
             return True
@@ -688,6 +775,7 @@ class PackPromptGeneratorCore:
                       s2_source: str,
                       s3_source: str,
                       character_filter: str,
+                      character_sequence_input: str,
                       random_pool: str,
                       civitai_id_input: str,
                       civitai_api_key: str,
@@ -784,33 +872,37 @@ class PackPromptGeneratorCore:
             if df.empty:
                 raise ValueError("Planilha vazia.")
 
-            df_pool = df
-
-            if character_filter and character_filter.strip():
-                if not tags_rule_col:
-                    raise ValueError("Coluna TAGS RULE não encontrada para filtro.")
-                filtro = character_filter.strip().lower()
-                mask = df_pool[tags_rule_col].astype(str).str.lower().str.contains(filtro, na=False)
-                df_pool = df_pool[mask]
-                if df_pool.empty:
-                    raise ValueError(f"Nenhum personagem encontrado para filtro: {character_filter}")
+            sequence_text = str(character_sequence_input).strip() if character_sequence_input else ""
+            if sequence_text:
+                row = self._select_row_by_sequence(df, sequence_text, spreadsheet)
             else:
-                pool_map = {
-                    "all": None,
-                    "top 150": 150,
-                    "top 100": 100,
-                    "top 75": 75,
-                    "top 50": 50,
-                    "top 25": 25,
-                }
-                limit = pool_map.get(random_pool, None)
-                if limit:
-                    df_pool = df_pool.head(limit)
-                    if df_pool.empty:
-                        raise ValueError("A seleção de top N não contém personagens.")
+                df_pool = df
 
-            random_state = rng.rng.randint(0, 2**32 - 1)
-            row = df_pool.sample(n=1, random_state=random_state).iloc[0]
+                if character_filter and character_filter.strip():
+                    if not tags_rule_col:
+                        raise ValueError("Coluna TAGS RULE não encontrada para filtro.")
+                    filtro = character_filter.strip().lower()
+                    mask = df_pool[tags_rule_col].astype(str).str.lower().str.contains(filtro, na=False)
+                    df_pool = df_pool[mask]
+                    if df_pool.empty:
+                        raise ValueError(f"Nenhum personagem encontrado para filtro: {character_filter}")
+                else:
+                    pool_map = {
+                        "all": None,
+                        "top 150": 150,
+                        "top 100": 100,
+                        "top 75": 75,
+                        "top 50": 50,
+                        "top 25": 25,
+                    }
+                    limit = pool_map.get(random_pool, None)
+                    if limit:
+                        df_pool = df_pool.head(limit)
+                        if df_pool.empty:
+                            raise ValueError("A seleção de top N não contém personagens.")
+
+                random_state = rng.rng.randint(0, 2**32 - 1)
+                row = df_pool.sample(n=1, random_state=random_state).iloc[0]
 
             tags_rule = str(row.get(tags_rule_col, "")).strip() if tags_rule_col else ""
             civitai_id_sheet = self._process_civitai_id(row.get(civitai_col, "")) if civitai_col else ""
@@ -924,6 +1016,11 @@ class PackPromptGeneratorNode:
                     "multiline": False,
                     "placeholder": "Filtrar pelo TAGS RULE (ex: boku_no_hero)"
                 }),
+                "character_sequence": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "Sequência por índice (ex: 5~11 ou 5;10;80). Um por execução."
+                }),
                 "random_pool": (["all", "top 150", "top 100", "top 75", "top 50", "top 25"], {"default": "all"}),
                 "civitai_id": ("STRING", {
                     "default": "",
@@ -986,6 +1083,7 @@ class PackPromptGeneratorNode:
               s3_source,
               spreadsheet,
               character_filter,
+              character_sequence,
               random_pool,
               civitai_id,
               civitai_api_key,
@@ -1015,6 +1113,7 @@ class PackPromptGeneratorNode:
                 s2_source=s2_source,
                 s3_source=s3_source,
                 character_filter=character_filter,
+                character_sequence_input=character_sequence,
                 random_pool=random_pool,
                 civitai_id_input=civitai_id,
                 civitai_api_key=civitai_api_key,
