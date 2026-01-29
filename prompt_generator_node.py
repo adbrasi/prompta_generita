@@ -145,12 +145,35 @@ class CivitaiAPI:
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
-        self.base_headers = {"Content-Type": "application/json"}
+        self.base_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Packreator/1.0",
+        }
         if api_key:
             self.base_headers["Authorization"] = f"Bearer {api_key}"
 
+    @staticmethod
+    def _redact_token(url: str) -> str:
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        if "token" in query:
+            query["token"] = ["***"]
+        new_query = urllib.parse.urlencode(query, doseq=True)
+        return urllib.parse.urlunparse(parsed._replace(query=new_query))
+
+    def _build_url(self, endpoint: str, include_token: bool = False) -> str:
+        base_url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
+        if not include_token or not self.api_key:
+            return base_url
+        parsed = urllib.parse.urlparse(base_url)
+        query = urllib.parse.parse_qs(parsed.query)
+        query.setdefault("token", [self.api_key])
+        new_query = urllib.parse.urlencode(query, doseq=True)
+        return urllib.parse.urlunparse(parsed._replace(query=new_query))
+
     def _request(self, endpoint: str) -> Optional[Dict[str, Any]]:
-        url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
+        url = self._build_url(endpoint, include_token=False)
         req = urllib.request.Request(url, headers=self.base_headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -159,8 +182,25 @@ class CivitaiAPI:
                 body = resp.read().decode("utf-8")
             return json.loads(body) if body else None
         except urllib.error.HTTPError as http_err:
-            logger.warning(f"Erro de API do Civitai: {http_err} (URL: {url})")
-            return {"error": str(http_err), "status_code": http_err.code}
+            if http_err.code == 403 and self.api_key:
+                retry_url = self._build_url(endpoint, include_token=True)
+                try:
+                    retry_req = urllib.request.Request(retry_url, headers=self.base_headers, method="GET")
+                    with urllib.request.urlopen(retry_req, timeout=30) as resp:
+                        if resp.status == 204:
+                            return None
+                        body = resp.read().decode("utf-8")
+                    return json.loads(body) if body else None
+                except urllib.error.HTTPError as retry_err:
+                    safe_url = self._redact_token(retry_url)
+                    logger.warning(f"Erro de API do Civitai (retry token): {retry_err} (URL: {safe_url})")
+                    return {"error": str(retry_err), "status_code": retry_err.code, "hint": "Falha mesmo com token na query string."}
+            safe_url = self._redact_token(url)
+            logger.warning(f"Erro de API do Civitai: {http_err} (URL: {safe_url})")
+            hint = ""
+            if http_err.code == 403:
+                hint = "403 Forbidden. Verifique se a civitai_api_key é necessária ou tem acesso ao modelo."
+            return {"error": str(http_err), "status_code": http_err.code, "hint": hint}
         except urllib.error.URLError as req_err:
             logger.warning(f"Erro de requisição do Civitai: {req_err}")
             return {"error": str(req_err)}
@@ -230,6 +270,10 @@ def get_civitai_details(link_or_id: str, api_key: Optional[str] = None) -> Dict[
 
         model_info = api.get_model_info(model_id)
         if not model_info or "error" in model_info:
+            if isinstance(model_info, dict) and model_info.get("status_code") == 403:
+                if not api_key:
+                    return {"error": "Civitai retornou 403. Informe uma civitai_api_key válida para acessar o modelo."}
+                return {"error": "Civitai retornou 403. Verifique se sua civitai_api_key tem acesso ao modelo."}
             return {"error": f"Falha ao buscar informações do modelo ID {model_id}."}
 
         if not version_id:
@@ -242,6 +286,10 @@ def get_civitai_details(link_or_id: str, api_key: Optional[str] = None) -> Dict[
 
         version_info = api.get_model_version_info(version_id)
         if not version_info or "error" in version_info:
+            if isinstance(version_info, dict) and version_info.get("status_code") == 403:
+                if not api_key:
+                    return {"error": "Civitai retornou 403 ao buscar versão. Informe uma civitai_api_key válida."}
+                return {"error": "Civitai retornou 403 ao buscar versão. Verifique se sua civitai_api_key tem acesso."}
             return {"error": f"Falha ao buscar informações da versão ID {version_id}."}
 
     except Exception as e:
@@ -354,93 +402,6 @@ class PackPromptGeneratorCore:
             if key in normalized_map:
                 return normalized_map[key]
         return None
-
-    @staticmethod
-    def _normalize_sequence_key(text: str) -> str:
-        return re.sub(r"\s+", "", text.strip())
-
-    @staticmethod
-    def _parse_sequence_input(value: str) -> List[int]:
-        if not value or not str(value).strip():
-            return []
-        raw = str(value).strip()
-        parts = [p.strip() for p in raw.split(";") if p.strip()]
-        if not parts:
-            return []
-
-        indices: List[int] = []
-        for part in parts:
-            if "~" in part:
-                start_str, end_str = [p.strip() for p in part.split("~", 1)]
-                if not start_str.isdigit() or not end_str.isdigit():
-                    raise ValueError("Sequência inválida. Use números em '5~11' ou '5;10;80'.")
-                start = int(start_str)
-                end = int(end_str)
-                if start <= 0 or end <= 0:
-                    raise ValueError("Sequência inválida. Os índices devem ser >= 1.")
-                step = 1 if start <= end else -1
-                indices.extend(list(range(start, end + step, step)))
-            else:
-                if not part.isdigit():
-                    raise ValueError("Sequência inválida. Use números em '5~11' ou '5;10;80'.")
-                idx = int(part)
-                if idx <= 0:
-                    raise ValueError("Sequência inválida. Os índices devem ser >= 1.")
-                indices.append(idx)
-        return indices
-
-    def _sequence_state_path(self) -> Path:
-        return self.base_path / ".character_sequence_state.json"
-
-    def _load_sequence_state(self) -> Dict[str, int]:
-        path = self._sequence_state_path()
-        if not path.exists():
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return {str(k): int(v) for k, v in data.items() if isinstance(v, int)}
-        except Exception as e:
-            logger.warning(f"Falha ao ler estado de sequência: {e}")
-        return {}
-
-    def _save_sequence_state(self, state: Dict[str, int]) -> None:
-        path = self._sequence_state_path()
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=True, indent=2)
-        except Exception as e:
-            logger.warning(f"Falha ao salvar estado de sequência: {e}")
-
-    def _select_row_by_sequence(self,
-                                df: pd.DataFrame,
-                                sequence_input: str,
-                                spreadsheet: str) -> pd.Series:
-        indices = self._parse_sequence_input(sequence_input)
-        if not indices:
-            raise ValueError("Sequência vazia. Use algo como '5~11' ou '5;10;80'.")
-
-        total_rows = len(df)
-        if total_rows == 0:
-            raise ValueError("Planilha vazia.")
-
-        for idx in indices:
-            if idx < 1 or idx > total_rows:
-                raise ValueError(f"Índice {idx} fora do intervalo da planilha (1..{total_rows}).")
-
-        state = self._load_sequence_state()
-        key = f"{spreadsheet}|{self._normalize_sequence_key(sequence_input)}"
-        next_pos = state.get(key, 0)
-        if not isinstance(next_pos, int) or next_pos < 0 or next_pos >= len(indices):
-            next_pos = 0
-
-        selected_index = indices[next_pos]
-        row = df.iloc[selected_index - 1]
-
-        state[key] = (next_pos + 1) % len(indices)
-        self._save_sequence_state(state)
-        return row
 
     @staticmethod
     def _is_empty_civitai_id(value: Any) -> bool:
@@ -775,7 +736,6 @@ class PackPromptGeneratorCore:
                       s2_source: str,
                       s3_source: str,
                       character_filter: str,
-                      character_sequence_input: str,
                       random_pool: str,
                       civitai_id_input: str,
                       civitai_api_key: str,
@@ -816,6 +776,8 @@ class PackPromptGeneratorCore:
                 raise ValueError("Ative organização inteligente para a IA conseguir pegar os dados do Civitai.")
             civitai_id_value = str(civitai_id_input).strip()
             model_id, version_id = parse_civitai_input(civitai_id_value)
+            logger.info("Civitai ID informado: %s", civitai_id_value)
+            logger.info("Civitai parseado: model_id=%s version_id=%s", model_id, version_id)
             if not model_id and not version_id:
                 raise ValueError("Civitai ID inválido. Informe URL, ID numérico ou AIR ID válido.")
             civitai_details = get_civitai_details(civitai_id_value, api_key=civitai_api_key or None)
@@ -852,6 +814,7 @@ class PackPromptGeneratorCore:
             tags_rule = str(tags_rule_input).strip() if tags_rule_input else ""
             civitai_id_output = civitai_details.get("air_id", "") or self._process_civitai_id(civitai_id_value)
         else:
+            logger.info("Civitai ID vazio. Usando planilha para seleção de personagem.")
             sheet_path = self.base_path / spreadsheet
             df = self.sheet_cache.load(str(sheet_path))
 
@@ -872,37 +835,33 @@ class PackPromptGeneratorCore:
             if df.empty:
                 raise ValueError("Planilha vazia.")
 
-            sequence_text = str(character_sequence_input).strip() if character_sequence_input else ""
-            if sequence_text:
-                row = self._select_row_by_sequence(df, sequence_text, spreadsheet)
+            df_pool = df
+
+            if character_filter and character_filter.strip():
+                if not tags_rule_col:
+                    raise ValueError("Coluna TAGS RULE não encontrada para filtro.")
+                filtro = character_filter.strip().lower()
+                mask = df_pool[tags_rule_col].astype(str).str.lower().str.contains(filtro, na=False)
+                df_pool = df_pool[mask]
+                if df_pool.empty:
+                    raise ValueError(f"Nenhum personagem encontrado para filtro: {character_filter}")
             else:
-                df_pool = df
-
-                if character_filter and character_filter.strip():
-                    if not tags_rule_col:
-                        raise ValueError("Coluna TAGS RULE não encontrada para filtro.")
-                    filtro = character_filter.strip().lower()
-                    mask = df_pool[tags_rule_col].astype(str).str.lower().str.contains(filtro, na=False)
-                    df_pool = df_pool[mask]
+                pool_map = {
+                    "all": None,
+                    "top 150": 150,
+                    "top 100": 100,
+                    "top 75": 75,
+                    "top 50": 50,
+                    "top 25": 25,
+                }
+                limit = pool_map.get(random_pool, None)
+                if limit:
+                    df_pool = df_pool.head(limit)
                     if df_pool.empty:
-                        raise ValueError(f"Nenhum personagem encontrado para filtro: {character_filter}")
-                else:
-                    pool_map = {
-                        "all": None,
-                        "top 150": 150,
-                        "top 100": 100,
-                        "top 75": 75,
-                        "top 50": 50,
-                        "top 25": 25,
-                    }
-                    limit = pool_map.get(random_pool, None)
-                    if limit:
-                        df_pool = df_pool.head(limit)
-                        if df_pool.empty:
-                            raise ValueError("A seleção de top N não contém personagens.")
+                        raise ValueError("A seleção de top N não contém personagens.")
 
-                random_state = rng.rng.randint(0, 2**32 - 1)
-                row = df_pool.sample(n=1, random_state=random_state).iloc[0]
+            random_state = rng.rng.randint(0, 2**32 - 1)
+            row = df_pool.sample(n=1, random_state=random_state).iloc[0]
 
             tags_rule = str(row.get(tags_rule_col, "")).strip() if tags_rule_col else ""
             civitai_id_sheet = self._process_civitai_id(row.get(civitai_col, "")) if civitai_col else ""
@@ -1016,11 +975,6 @@ class PackPromptGeneratorNode:
                     "multiline": False,
                     "placeholder": "Filtrar pelo TAGS RULE (ex: boku_no_hero)"
                 }),
-                "character_sequence": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "placeholder": "Sequência por índice (ex: 5~11 ou 5;10;80). Um por execução."
-                }),
                 "random_pool": (["all", "top 150", "top 100", "top 75", "top 50", "top 25"], {"default": "all"}),
                 "civitai_id": ("STRING", {
                     "default": "",
@@ -1083,7 +1037,6 @@ class PackPromptGeneratorNode:
               s3_source,
               spreadsheet,
               character_filter,
-              character_sequence,
               random_pool,
               civitai_id,
               civitai_api_key,
@@ -1113,7 +1066,6 @@ class PackPromptGeneratorNode:
                 s2_source=s2_source,
                 s3_source=s3_source,
                 character_filter=character_filter,
-                character_sequence_input=character_sequence,
                 random_pool=random_pool,
                 civitai_id_input=civitai_id,
                 civitai_api_key=civitai_api_key,
