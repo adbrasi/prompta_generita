@@ -375,6 +375,9 @@ class PackPromptGeneratorCore:
         self.sections_path = self.base_path / "sections"
         self.file_cache = PromptFileCache()
         self.sheet_cache = CharacterSheetCache()
+        self._sequential_state_path = self.base_path / "sequential_state.json"
+
+    _SEQUENTIAL_RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*~\s*(\d+)\s*$")
 
     @staticmethod
     def _normalize_key(value: str) -> str:
@@ -432,6 +435,60 @@ class PackPromptGeneratorCore:
         if civitai_str.startswith("urn:") and ":" in civitai_str:
             return civitai_str.split(":")[-1]
         return civitai_str
+
+    def _parse_sequential_range(self, value: Any) -> Optional[Tuple[int, int]]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        match = self._SEQUENTIAL_RANGE_PATTERN.match(text)
+        if not match:
+            raise ValueError("Faixa sequencial inválida. Use o formato 5~10.")
+        start = int(match.group(1))
+        end = int(match.group(2))
+        if start <= 0 or end <= 0:
+            raise ValueError("Faixa sequencial inválida. Use números >= 1.")
+        if start > end:
+            raise ValueError("Faixa sequencial inválida. O início não pode ser maior que o fim.")
+        return start, end
+
+    @staticmethod
+    def _build_sequential_state_key(spreadsheet: str,
+                                    character_filter: str,
+                                    random_pool: str,
+                                    seq_range: Tuple[int, int]) -> str:
+        start, end = seq_range
+        filter_part = (character_filter or "").strip().lower()
+        pool_part = (random_pool or "").strip().lower()
+        return f"{spreadsheet}|filter={filter_part}|pool={pool_part}|range={start}~{end}"
+
+    def _load_sequential_state(self) -> Dict[str, int]:
+        if not self._sequential_state_path.exists():
+            return {}
+        try:
+            with open(self._sequential_state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning("Falha ao ler estado sequencial: %s", e)
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("Estado sequencial inválido (esperado dict). Resetando.")
+            return {}
+        cleaned: Dict[str, int] = {}
+        for key, value in data.items():
+            try:
+                cleaned[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return cleaned
+
+    def _save_sequential_state(self, state: Dict[str, int]) -> None:
+        try:
+            with open(self._sequential_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=True, indent=2, sort_keys=True)
+        except Exception as e:
+            logger.warning("Falha ao salvar estado sequencial: %s", e)
 
     def _load_outfits(self, row: pd.Series, outfit_columns: List[str]) -> List[str]:
         outfits = []
@@ -736,6 +793,7 @@ class PackPromptGeneratorCore:
                       s2_source: str,
                       s3_source: str,
                       character_filter: str,
+                      sequential_range: str,
                       random_pool: str,
                       civitai_id_input: str,
                       civitai_api_key: str,
@@ -772,6 +830,8 @@ class PackPromptGeneratorCore:
         selections: Dict[str, List[str]] = {"s1": [], "s2": [], "s3": []}
 
         if use_civitai:
+            if sequential_range and str(sequential_range).strip():
+                logger.info("Faixa sequencial ignorada porque o Civitai ID está ativo.")
             if not organizacao_inteligente:
                 raise ValueError("Ative organização inteligente para a IA conseguir pegar os dados do Civitai.")
             civitai_id_value = str(civitai_id_input).strip()
@@ -859,9 +919,45 @@ class PackPromptGeneratorCore:
                     df_pool = df_pool.head(limit)
                     if df_pool.empty:
                         raise ValueError("A seleção de top N não contém personagens.")
-
-            random_state = rng.rng.randint(0, 2**32 - 1)
-            row = df_pool.sample(n=1, random_state=random_state).iloc[0]
+            seq_range = self._parse_sequential_range(sequential_range)
+            if seq_range:
+                start, end = seq_range
+                if df_pool.empty:
+                    raise ValueError("Lista vazia após filtros. Ajuste o filtro ou a faixa sequencial.")
+                if end > len(df_pool):
+                    raise ValueError(
+                        f"Faixa sequencial {start}~{end} excede o total de {len(df_pool)} personagens."
+                    )
+                state = self._load_sequential_state()
+                state_key = self._build_sequential_state_key(
+                    spreadsheet=spreadsheet,
+                    character_filter=character_filter,
+                    random_pool=random_pool,
+                    seq_range=seq_range,
+                )
+                next_index = state.get(state_key, start)
+                try:
+                    next_index = int(next_index)
+                except (TypeError, ValueError):
+                    next_index = start
+                if next_index < start or next_index > end:
+                    next_index = start
+                row = df_pool.iloc[next_index - 1]
+                following = next_index + 1
+                if following > end:
+                    following = start
+                state[state_key] = following
+                self._save_sequential_state(state)
+                logger.info(
+                    "Faixa sequencial ativa (%s~%s). Selecionado índice %s; próximo %s.",
+                    start,
+                    end,
+                    next_index,
+                    following,
+                )
+            else:
+                random_state = rng.rng.randint(0, 2**32 - 1)
+                row = df_pool.sample(n=1, random_state=random_state).iloc[0]
 
             tags_rule = str(row.get(tags_rule_col, "")).strip() if tags_rule_col else ""
             civitai_id_sheet = self._process_civitai_id(row.get(civitai_col, "")) if civitai_col else ""
@@ -975,6 +1071,11 @@ class PackPromptGeneratorNode:
                     "multiline": False,
                     "placeholder": "Filtrar pelo TAGS RULE (ex: boku_no_hero)"
                 }),
+                "sequential_range": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "Faixa sequencial (ex: 5~10)"
+                }),
                 "random_pool": (["all", "top 150", "top 100", "top 75", "top 50", "top 25"], {"default": "all"}),
                 "civitai_id": ("STRING", {
                     "default": "",
@@ -1037,6 +1138,7 @@ class PackPromptGeneratorNode:
               s3_source,
               spreadsheet,
               character_filter,
+              sequential_range,
               random_pool,
               civitai_id,
               civitai_api_key,
@@ -1066,6 +1168,7 @@ class PackPromptGeneratorNode:
                 s2_source=s2_source,
                 s3_source=s3_source,
                 character_filter=character_filter,
+                sequential_range=sequential_range,
                 random_pool=random_pool,
                 civitai_id_input=civitai_id,
                 civitai_api_key=civitai_api_key,
